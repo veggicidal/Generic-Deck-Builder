@@ -653,6 +653,7 @@ class CardApp:
                             card_name = os.path.basename(path)
                             self.subdecks[current_subdeck]['cards'][card_name] = {'path': path, 'count': count}
                             self.card_rotation[path] = rotation
+                            self.update_deck_view(current_subdeck)
         if not Subdeck1Used:
             self.delete_subdeck("Subdeck 1")
     def create_pdf(self):
