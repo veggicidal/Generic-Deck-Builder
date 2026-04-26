@@ -3,7 +3,7 @@ Overview
 The Generic TCG Deckbuilder is a standalone application designed to help users manage and organize their trading card game (TCG) collections. The application allows users to load card images, create and manage decks, extract text from card images, and generate PDFs of their decks.
 
 Installation
-Get Tesseract OCR. Install Python and all dependancies.
+Get Tesseract OCR if you want to use the AI text recognition. It works with GBP_CV.py. If you don't care about that, just use the GBP.py Install Python and all dependancies.
 
 Usage
 Running the Application
