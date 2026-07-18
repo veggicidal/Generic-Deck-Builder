@@ -1,9 +1,6 @@
 Generic TCG Deckbuilder
 Overview
-The Generic TCG Deckbuilder is a standalone application designed to help users manage and organize their trading card game (TCG) collections. The application allows users to load card images, create and manage decks, extract text from card images, and generate PDFs of their decks. This program is packaged as an executable file and can be run on any computer without any dependencies.
-
-Installation
-No installation is required. Simply download the executable file and run it on your computer.
+The Generic TCG Deckbuilder is a standalone application designed to help users manage and organize their trading card game (TCG) collections. The application allows users to load card images, create and manage decks, extract text from card images, and generate PDFs of their decks.
 
 Usage
 Running the Application
@@ -16,6 +13,7 @@ Usage: Click the "Load Card Images" button in the top frame.
 2. Making Image Text Searchable
 Description: Extracts text from the loaded card images and makes it searchable.
 Usage: Click the "Make Image Text Searchable" button in the top frame.
+You can adjust the image processing parameters to attempt to get a better result by clicking "Adjust Processing Parameters" in the file menu.
 3. Creating a New Deck
 Description: Clears the current deck and creates a new empty deck.
 Usage: Select "New Deck" from the "File" menu.
