@@ -14,10 +14,12 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
 
-APP_NAME = "Generic TCG Deckbuilder"
-DATA_VERSION = 2
+APP_NAME = "Generic Deck Builder"
+APP_VERSION = "2.1.0"
+DATA_VERSION = 3
 OCR_ENGINE_NAME = "Windows.Media.Ocr"
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
+APP_ICON_RELATIVE_PATH = os.path.join("icons", "icon-1.ico")
 
 
 def get_app_base_path():
@@ -37,6 +39,19 @@ def get_file_signature(path):
     except OSError:
         return None
     return {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+
+
+def get_filename_search_text(card_path, root_dir=None):
+    search_parts = [os.path.basename(card_path), os.path.splitext(os.path.basename(card_path))[0]]
+    if root_dir:
+        try:
+            search_parts.append(os.path.relpath(card_path, root_dir))
+        except ValueError:
+            pass
+    search_text = " ".join(search_parts)
+    for separator in ("-", "_", ".", "\\", "/"):
+        search_text = search_text.replace(separator, " ")
+    return search_text
 
 
 class ImageText:
@@ -61,7 +76,8 @@ class ImageText:
             except ImportError as exc:
                 raise RuntimeError(
                     "Windows OCR requires the winsdk Python package. "
-                    "Install it with: python -m pip install winsdk"
+                    "Install it in this Python environment with: python -m pip install winsdk\n"
+                    f"Current Python: {sys.executable}"
                 ) from exc
         cls._ocr_bindings = {
             "BitmapPixelFormat": BitmapPixelFormat,
@@ -119,7 +135,11 @@ class ImageText:
         if image.mode != "RGBA":
             image = image.convert("RGBA")
 
-        max_dimension = getattr(engine, "max_image_dimension", 0) or 0
+        max_dimension = (
+            getattr(engine, "max_image_dimension", 0)
+            or getattr(bindings["OcrEngine"], "max_image_dimension", 0)
+            or 0
+        )
         if max_dimension and max(image.size) > max_dimension:
             scale = max_dimension / max(image.size)
             new_size = (
@@ -157,9 +177,21 @@ class ImageText:
             asyncio.get_running_loop()
         except RuntimeError:
             return asyncio.run(cls.extract_text_async(image))
-        raise RuntimeError(
-            "Windows OCR cannot be run synchronously while another asyncio loop is active."
-        )
+
+        result = {"text": "", "error": None}
+
+        def run_ocr_on_thread():
+            try:
+                result["text"] = asyncio.run(cls.extract_text_async(image))
+            except Exception as exc:
+                result["error"] = exc
+
+        thread = threading.Thread(target=run_ocr_on_thread, daemon=True)
+        thread.start()
+        thread.join()
+        if result["error"]:
+            raise result["error"]
+        return result["text"]
 
 
 class FileManager:
@@ -178,6 +210,8 @@ class FileManager:
     def save_collection(collection, card_text, filepath, card_rotation, ocr_cache):
         data = {
             "version": DATA_VERSION,
+            "app_name": APP_NAME,
+            "app_version": APP_VERSION,
             "type": "collection",
             "collection": collection,
             "card_text": card_text,
@@ -223,6 +257,8 @@ class FileManager:
     def save_deck(filepath, subdecks, card_rotation):
         data = {
             "version": DATA_VERSION,
+            "app_name": APP_NAME,
+            "app_version": APP_VERSION,
             "type": "deck",
             "subdecks": {
                 name: {"cards": info.get("cards", {})}
@@ -386,7 +422,8 @@ class PDFManager:
 class CardApp:
     def __init__(self, root):
         self.root = root
-        self.root.title(APP_NAME)
+        self.root.title(f"{APP_NAME} {APP_VERSION}")
+        self.set_window_icon()
         self.collection = []
         self.subdecks = {}
         self.current_card = None
@@ -398,6 +435,8 @@ class CardApp:
         self.ocr_queue = queue.Queue()
         self.ocr_cancel_event = threading.Event()
         self.ocr_thread = None
+        self.pdf_queue = queue.Queue()
+        self.pdf_thread = None
         self.active_ocr_settings = None
         self.pending_collection_refresh = False
         self.collection_root_dir = None
@@ -414,6 +453,20 @@ class CardApp:
         self.setup_ui()
         self.new_deck()
 
+    def set_window_icon(self):
+        icon_path = get_resource_path(APP_ICON_RELATIVE_PATH)
+        if not os.path.exists(icon_path):
+            return
+        try:
+            self.root.iconbitmap(icon_path)
+        except tk.TclError:
+            try:
+                icon_image = ImageTk.PhotoImage(file=icon_path)
+                self.root.iconphoto(True, icon_image)
+                self.root._app_icon_image = icon_image
+            except tk.TclError:
+                pass
+
     def get_ocr_settings(self):
         return {
             "ocr_engine": OCR_ENGINE_NAME,
@@ -429,21 +482,21 @@ class CardApp:
 
     def setup_menu(self):
         menu = tk.Menu(self.root)
-        file_menu = tk.Menu(menu, tearoff=0)
-        file_menu.add_command(label="New Deck", command=self.new_deck)
-        file_menu.add_command(label="Save Deck", command=self.save_deck)
-        file_menu.add_command(label="Open Deck", command=self.open_deck)
-        file_menu.add_separator()
-        file_menu.add_command(label="Create PDF", command=self.create_pdf)
-        file_menu.add_separator()
-        file_menu.add_command(label="Save Collection File", command=self.save_collection)
-        file_menu.add_command(label="Load Collection File", command=self.load_collection_file)
-        file_menu.add_separator()
-        file_menu.add_command(
+        self.file_menu = tk.Menu(menu, tearoff=0)
+        self.file_menu.add_command(label="New Deck", command=self.new_deck)
+        self.file_menu.add_command(label="Save Deck", command=self.save_deck)
+        self.file_menu.add_command(label="Open Deck", command=self.open_deck)
+        self.file_menu.add_separator()
+        self.file_menu.add_command(label="Create PDF", command=self.create_pdf)
+        self.file_menu.add_separator()
+        self.file_menu.add_command(label="Save Collection File", command=self.save_collection)
+        self.file_menu.add_command(label="Load Collection File", command=self.load_collection_file)
+        self.file_menu.add_separator()
+        self.file_menu.add_command(
             label="Adjust Windows OCR Processing", command=self.open_slider_window
         )
-        file_menu.add_command(label="Show OCR Error Log", command=self.show_ocr_errors)
-        menu.add_cascade(label="File", menu=file_menu)
+        self.file_menu.add_command(label="Show OCR Error Log", command=self.show_ocr_errors)
+        menu.add_cascade(label="File", menu=self.file_menu)
         self.root.config(menu=menu)
 
     def setup_main_pane(self):
@@ -497,6 +550,10 @@ class CardApp:
         tk.Button(
             preview_container, text="Rotate 90 degrees", command=self.rotate_current_card
         ).pack(side=tk.BOTTOM, fill=tk.X)
+        self.current_card_ocr_button = tk.Button(
+            preview_container, text="OCR Selected Card", command=self.load_current_card_text
+        )
+        self.current_card_ocr_button.pack(side=tk.BOTTOM, fill=tk.X)
 
         self.card_preview = tk.Label(
             preview_container,
@@ -549,7 +606,9 @@ class CardApp:
     def open_slider_window(self):
         slider_window = tk.Toplevel(self.root)
         slider_window.title("Adjust Windows OCR Processing")
-        slider_window.resizable(False, False)
+        slider_window.geometry("900x850")
+        slider_window.minsize(640, 620)
+        slider_window.resizable(True, True)
 
         controls_frame = tk.Frame(slider_window, padx=10, pady=10)
         controls_frame.pack(fill=tk.BOTH, expand=True)
@@ -560,7 +619,7 @@ class CardApp:
             from_=100,
             to_=300,
             orient=tk.HORIZONTAL,
-            length=280,
+            length=520,
             label="Percent",
         )
         scale_percent_slider.set(self.scale_percent)
@@ -572,7 +631,7 @@ class CardApp:
             from_=0,
             to_=100,
             orient=tk.HORIZONTAL,
-            length=280,
+            length=520,
             label="Percent",
         )
         smoothing_slider.set(self.smoothing_percent)
@@ -584,7 +643,7 @@ class CardApp:
             from_=50,
             to_=250,
             orient=tk.HORIZONTAL,
-            length=280,
+            length=520,
             label="Percent",
         )
         contrast_slider.set(self.contrast_percent)
@@ -596,16 +655,24 @@ class CardApp:
             from_=0,
             to_=300,
             orient=tk.HORIZONTAL,
-            length=280,
+            length=520,
             label="Percent",
         )
         sharpness_slider.set(self.sharpness_percent)
         sharpness_slider.pack(fill=tk.X)
 
         result_label = tk.Label(
-            controls_frame, text="", anchor=tk.W, justify=tk.LEFT, wraplength=280
+            controls_frame, text="", anchor=tk.W, justify=tk.LEFT, wraplength=820
         )
         result_label.pack(fill=tk.X, pady=(8, 0))
+        preview_frame = tk.Frame(controls_frame, bg="gray")
+        preview_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        processed_preview = tk.Label(
+            preview_frame,
+            text="Select a card to preview OCR processing",
+            bg="gray",
+        )
+        processed_preview.pack(fill=tk.BOTH, expand=True)
 
         def selected_settings():
             return {
@@ -616,11 +683,44 @@ class CardApp:
                 "sharpness_percent": sharpness_slider.get(),
             }
 
+        def update_processed_preview(processed_image=None):
+            if not self.current_card:
+                processed_preview.config(
+                    image="", text="Select a card to preview OCR processing"
+                )
+                processed_preview.image = None
+                return None
+            try:
+                if processed_image is None:
+                    processed_image = ImageText.preprocess_image(
+                        self.current_card,
+                        selected_settings(),
+                        self.card_rotation.get(self.current_card, 0),
+                    )
+                preview_image = processed_image.copy()
+                preview_frame.update_idletasks()
+                max_width = preview_frame.winfo_width() - 20
+                max_height = preview_frame.winfo_height() - 20
+                if max_width < 100:
+                    max_width = 820
+                if max_height < 100:
+                    max_height = 420
+                preview_image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
+                preview_tk = ImageTk.PhotoImage(preview_image)
+                processed_preview.config(image=preview_tk, text="")
+                processed_preview.image = preview_tk
+                return processed_image
+            except Exception as exc:
+                processed_preview.config(image="", text=f"Preview failed: {exc}")
+                processed_preview.image = None
+                return None
+
         def apply_changes():
             self.scale_percent = scale_percent_slider.get()
             self.smoothing_percent = smoothing_slider.get()
             self.contrast_percent = contrast_slider.get()
             self.sharpness_percent = sharpness_slider.get()
+            update_processed_preview()
             messagebox.showinfo(
                 "Parameters Applied",
                 "Windows OCR processing parameters updated successfully.",
@@ -638,6 +738,7 @@ class CardApp:
                 processed_image = ImageText.preprocess_image(
                     self.current_card, settings, rotation
                 )
+                update_processed_preview(processed_image)
                 text = ImageText.extract_text(processed_image).strip()
                 self.set_card_text(self.current_card, text, settings)
                 self.textbox.delete("1.0", tk.END)
@@ -660,6 +761,25 @@ class CardApp:
         tk.Button(
             button_frame, text="Test Current Card", command=update_ocr_text
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        for slider in (
+            scale_percent_slider,
+            smoothing_slider,
+            contrast_slider,
+            sharpness_slider,
+        ):
+            slider.config(command=lambda _value: update_processed_preview())
+
+        resize_job = None
+
+        def refresh_preview_after_resize(_event):
+            nonlocal resize_job
+            if resize_job:
+                slider_window.after_cancel(resize_job)
+            resize_job = slider_window.after(150, update_processed_preview)
+
+        preview_frame.bind("<Configure>", refresh_preview_after_resize)
+        update_processed_preview()
 
     def show_ocr_errors(self):
         log_window = tk.Toplevel(self.root)
@@ -715,18 +835,30 @@ class CardApp:
             "Windows OCR can take a while. Cached cards will be skipped. Do you want to proceed?",
         ):
             return
+        self.run_ocr_for_cards(list(self.collection), "Starting Windows OCR...")
 
+    def load_current_card_text(self):
+        if self.ocr_thread and self.ocr_thread.is_alive():
+            messagebox.showinfo("OCR Running", "OCR is already running.")
+            return
+        if not self.current_card:
+            messagebox.showinfo("No Card Selected", "Select a card before running OCR.")
+            return
+        self.run_ocr_for_cards([self.current_card], "Starting OCR for selected card...")
+
+    def run_ocr_for_cards(self, cards, starting_status):
         settings = self.get_ocr_settings()
         self.active_ocr_settings = settings
         self.ocr_errors.clear()
         self.ocr_cancel_event.clear()
         self.pending_collection_refresh = False
         self.progress_var.set(0)
-        self.status_var.set("Starting Windows OCR...")
+        self.status_var.set(starting_status)
         self.ocr_button.config(state=tk.DISABLED)
+        self.current_card_ocr_button.config(state=tk.DISABLED)
         self.cancel_ocr_button.config(state=tk.NORMAL)
         self.ocr_thread = threading.Thread(
-            target=self.ocr_worker, args=(list(self.collection), settings), daemon=True
+            target=self.ocr_worker, args=(cards, settings), daemon=True
         )
         self.ocr_thread.start()
         self.root.after(100, self.poll_ocr_queue)
@@ -793,6 +925,7 @@ class CardApp:
 
     def finish_ocr(self, cancelled):
         self.ocr_button.config(state=tk.NORMAL)
+        self.current_card_ocr_button.config(state=tk.NORMAL)
         self.cancel_ocr_button.config(state=tk.DISABLED)
         self.active_ocr_settings = None
         if self.pending_collection_refresh:
@@ -979,6 +1112,17 @@ class CardApp:
                 pass
         return os.path.basename(card_path)
 
+    def get_card_search_text(self, card_path, card_label=None):
+        return " ".join(
+            part
+            for part in (
+                card_label,
+                self.card_text.get(card_path, ""),
+                get_filename_search_text(card_path, self.collection_root_dir),
+            )
+            if part
+        ).lower()
+
     def update_collection_view(self, *_):
         search_query = self.search_var.get().lower()
         self.collection_listbox.delete(0, tk.END)
@@ -987,8 +1131,7 @@ class CardApp:
         if search_query:
             for card in self.collection:
                 card_label = self.format_card_label(card, include_relative_path=True)
-                extracted_text = self.card_text.get(card, "")
-                if search_query in card_label.lower() or search_query in extracted_text.lower():
+                if search_query in self.get_card_search_text(card, card_label):
                     self.collection_listbox.insert(tk.END, card_label)
                     self.collection_view_items.append({"type": "card", "path": card})
             return
@@ -1165,6 +1308,10 @@ class CardApp:
                 self.add_subdeck_tab(subdeck_name)
 
     def create_pdf(self):
+        if self.pdf_thread and self.pdf_thread.is_alive():
+            messagebox.showinfo("PDF Running", "A PDF is already being created.")
+            return
+
         options = {
             "margin": 18,
             "h_spacing": 0,
@@ -1207,24 +1354,101 @@ class CardApp:
                     value = opt_entries[key].get()
                     options[key] = float(value) if "." in value else int(value)
                 options["orientation"] = orientation_var.get()
-                images_paths = [
+                image_paths = [
                     info["path"]
                     for subdeck_info in self.subdecks.values()
                     for info in subdeck_info["cards"].values()
                     for _ in range(info["count"])
                 ]
-                images = [Image.open(path) for path in images_paths]
+                if not image_paths:
+                    messagebox.showinfo("No Cards", "Add cards to the deck before creating a PDF.")
+                    return
                 output_file = filedialog.asksaveasfilename(
                     defaultextension=".pdf", filetypes=[("PDF files", "*.pdf")]
                 )
                 if output_file:
-                    PDFManager(images, output_file, options).create_pdf()
-                    messagebox.showinfo("Success", "PDF created successfully.")
-                new_window.destroy()
+                    new_window.destroy()
+                    self.start_pdf_worker(image_paths, output_file, dict(options))
             except Exception as exc:
                 messagebox.showerror("PDF Error", f"Failed to create PDF: {exc}")
 
         tk.Button(new_window, text="Apply", command=apply_settings).pack(fill=tk.X)
+
+    def set_pdf_controls_enabled(self, enabled):
+        state = tk.NORMAL if enabled else tk.DISABLED
+        try:
+            self.file_menu.entryconfig("Create PDF", state=state)
+        except tk.TclError:
+            pass
+
+    def start_pdf_worker(self, image_paths, output_file, options):
+        self.set_pdf_controls_enabled(False)
+        self.progress_var.set(0)
+        self.status_var.set("Starting PDF...")
+        while not self.pdf_queue.empty():
+            try:
+                self.pdf_queue.get_nowait()
+            except queue.Empty:
+                break
+        self.pdf_thread = threading.Thread(
+            target=self.pdf_worker,
+            args=(image_paths, output_file, options),
+            daemon=True,
+        )
+        self.pdf_thread.start()
+        self.root.after(100, self.poll_pdf_queue)
+
+    def pdf_worker(self, image_paths, output_file, options):
+        images = []
+        total = len(image_paths)
+        try:
+            for index, path in enumerate(image_paths, start=1):
+                image = Image.open(path)
+                image.load()
+                images.append(image)
+                self.pdf_queue.put(("progress", index, total))
+            PDFManager(images, output_file, options).create_pdf()
+            self.pdf_queue.put(("done", output_file, total))
+        except Exception as exc:
+            self.pdf_queue.put(("error", str(exc)))
+        finally:
+            for image in images:
+                close_image = getattr(image, "close", None)
+                if close_image:
+                    close_image()
+
+    def poll_pdf_queue(self):
+        should_continue = True
+        while True:
+            try:
+                message = self.pdf_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            kind = message[0]
+            if kind == "progress":
+                _, index, total = message
+                self.progress_var.set((index / total) * 100)
+                self.status_var.set(f"Loading PDF images: {index}/{total}")
+            elif kind == "done":
+                _, output_file, total = message
+                self.progress_var.set(100)
+                self.status_var.set(f"PDF created: {total} cards")
+                self.finish_pdf()
+                messagebox.showinfo("Success", f"PDF created successfully:\n{output_file}")
+                should_continue = False
+            elif kind == "error":
+                _, error = message
+                self.status_var.set("PDF creation failed")
+                self.finish_pdf()
+                messagebox.showerror("PDF Error", f"Failed to create PDF: {error}")
+                should_continue = False
+
+        if should_continue and self.pdf_thread and self.pdf_thread.is_alive():
+            self.root.after(100, self.poll_pdf_queue)
+
+    def finish_pdf(self):
+        self.set_pdf_controls_enabled(True)
 
 
 if __name__ == "__main__":
