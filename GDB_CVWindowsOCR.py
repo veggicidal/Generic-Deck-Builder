@@ -1,4 +1,5 @@
 import io
+import asyncio
 import json
 import os
 import queue
@@ -7,10 +8,7 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
-import cv2 as opencv
-import numpy as np
-import pytesseract
-from PIL import Image, ImageTk
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageTk
 from reportlab.lib.pagesizes import landscape, letter
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
@@ -18,6 +16,7 @@ from reportlab.pdfgen import canvas
 
 APP_NAME = "Generic TCG Deckbuilder"
 DATA_VERSION = 2
+OCR_ENGINE_NAME = "Windows.Media.Ocr"
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
 
 
@@ -32,34 +31,6 @@ def get_resource_path(relative_path):
     return os.path.join(get_app_base_path(), relative_path)
 
 
-def first_existing_path(*paths):
-    for path in paths:
-        if path and os.path.exists(path):
-            return path
-    return paths[0] if paths else ""
-
-
-def configure_tesseract():
-    bundled_tesseract = get_resource_path(os.path.join("Tesseract", "tesseract.exe"))
-    bundled_tessdata = get_resource_path(os.path.join("Tesseract", "tessdata"))
-    dev_tesseract = os.path.join("D:\\", "Tesseract", "tesseract.exe")
-    dev_tessdata = os.path.join("D:\\", "Tesseract", "tessdata")
-
-    tesseract_path = first_existing_path(bundled_tesseract, dev_tesseract)
-    tessdata_dir = first_existing_path(bundled_tessdata, dev_tessdata)
-    tesseract_dir = os.path.dirname(tesseract_path)
-
-    pytesseract.pytesseract.tesseract_cmd = tesseract_path
-    os.environ["TESSDATA_PREFIX"] = tessdata_dir
-    os.environ["PATH"] = os.pathsep.join(
-        [get_app_base_path(), tesseract_dir, os.environ.get("PATH", "")]
-    )
-    return tesseract_path, tessdata_dir
-
-
-TESSERACT_PATH, TESSDATA_DIR = configure_tesseract()
-
-
 def get_file_signature(path):
     try:
         stat = os.stat(path)
@@ -71,42 +42,124 @@ def get_file_signature(path):
 class ImageText:
     """Handles image preprocessing and text extraction."""
 
+    _ocr_bindings = None
+    _ocr_engine = None
+
+    @classmethod
+    def load_ocr_bindings(cls):
+        if cls._ocr_bindings:
+            return cls._ocr_bindings
+        try:
+            from winsdk.windows.graphics.imaging import BitmapPixelFormat, SoftwareBitmap
+            from winsdk.windows.media.ocr import OcrEngine
+            from winsdk.windows.storage.streams import DataWriter
+        except ImportError:
+            try:
+                from winrt.windows.graphics.imaging import BitmapPixelFormat, SoftwareBitmap
+                from winrt.windows.media.ocr import OcrEngine
+                from winrt.windows.storage.streams import DataWriter
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Windows OCR requires the winsdk Python package. "
+                    "Install it with: python -m pip install winsdk"
+                ) from exc
+        cls._ocr_bindings = {
+            "BitmapPixelFormat": BitmapPixelFormat,
+            "SoftwareBitmap": SoftwareBitmap,
+            "OcrEngine": OcrEngine,
+            "DataWriter": DataWriter,
+        }
+        return cls._ocr_bindings
+
+    @classmethod
+    def get_ocr_engine(cls):
+        if cls._ocr_engine:
+            return cls._ocr_engine
+        bindings = cls.load_ocr_bindings()
+        engine = bindings["OcrEngine"].try_create_from_user_profile_languages()
+        if engine is None:
+            raise RuntimeError(
+                "Windows OCR is not available for the current user profile languages. "
+                "Install a Windows OCR language pack in Settings > Time & language > "
+                "Language & region, then try again."
+            )
+        cls._ocr_engine = engine
+        return engine
+
     @staticmethod
     def preprocess_image(image_path, settings, rotation=0):
-        image = opencv.imread(image_path, opencv.IMREAD_GRAYSCALE)
-        if image is None:
-            raise ValueError(f"Failed to load image at {image_path}")
+        try:
+            image = Image.open(image_path)
+            image.load()
+        except Exception as exc:
+            raise ValueError(f"Failed to load image at {image_path}") from exc
 
-        if rotation == 90:
-            image = opencv.rotate(image, opencv.ROTATE_90_CLOCKWISE)
-        elif rotation == 180:
-            image = opencv.rotate(image, opencv.ROTATE_180)
-        elif rotation == 270:
-            image = opencv.rotate(image, opencv.ROTATE_90_COUNTERCLOCKWISE)
+        if rotation:
+            image = image.rotate(-rotation, expand=True)
 
-        width = max(int(image.shape[1] * settings["scale_percent"] / 100), 1)
-        height = max(int(image.shape[0] * settings["scale_percent"] / 100), 1)
-        image = opencv.resize(image, (width, height), interpolation=opencv.INTER_LINEAR)
-        image = opencv.GaussianBlur(
-            image, (settings["blur_size"], settings["blur_size"]), 0
-        )
-        image = opencv.adaptiveThreshold(
-            image,
-            255,
-            opencv.ADAPTIVE_THRESH_GAUSSIAN_C,
-            opencv.THRESH_BINARY,
-            settings["block_size"],
-            settings["c_value"],
-        )
+        image = ImageOps.grayscale(image)
+        width = max(int(image.width * settings["scale_percent"] / 100), 1)
+        height = max(int(image.height * settings["scale_percent"] / 100), 1)
+        if (width, height) != image.size:
+            image = image.resize((width, height), Image.Resampling.LANCZOS)
 
-        black_pixels_mask = image == 0
-        image = np.full_like(image, 255)
-        image[black_pixels_mask] = 0
-        return image
+        blur_radius = max(int(settings["smoothing_percent"]) / 100, 0)
+        if blur_radius:
+            image = image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+        image = ImageOps.autocontrast(image)
+        contrast_factor = max(0.5, min(2.5, int(settings["contrast_percent"]) / 100))
+        image = ImageEnhance.Contrast(image).enhance(contrast_factor)
+        sharpness_factor = max(0.0, min(3.0, int(settings["sharpness_percent"]) / 100))
+        image = ImageEnhance.Sharpness(image).enhance(sharpness_factor)
+        return image.convert("RGBA")
 
     @staticmethod
-    def extract_text(image):
-        return str(pytesseract.image_to_string(image).strip())
+    def image_to_software_bitmap(image, engine, bindings):
+        if image.mode != "RGBA":
+            image = image.convert("RGBA")
+
+        max_dimension = getattr(engine, "max_image_dimension", 0) or 0
+        if max_dimension and max(image.size) > max_dimension:
+            scale = max_dimension / max(image.size)
+            new_size = (
+                max(int(image.width * scale), 1),
+                max(int(image.height * scale), 1),
+            )
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
+
+        SoftwareBitmap = bindings["SoftwareBitmap"]
+        BitmapPixelFormat = bindings["BitmapPixelFormat"]
+        DataWriter = bindings["DataWriter"]
+
+        bitmap = SoftwareBitmap(BitmapPixelFormat.RGBA8, image.width, image.height)
+        writer = DataWriter()
+        writer.write_bytes(image.tobytes())
+        bitmap.copy_from_buffer(writer.detach_buffer())
+        return bitmap
+
+    @classmethod
+    async def extract_text_async(cls, image):
+        engine = cls.get_ocr_engine()
+        bindings = cls.load_ocr_bindings()
+        bitmap = cls.image_to_software_bitmap(image, engine, bindings)
+        try:
+            result = await engine.recognize_async(bitmap)
+            return str(getattr(result, "text", "") or "").strip()
+        finally:
+            close_bitmap = getattr(bitmap, "close", None)
+            if close_bitmap:
+                close_bitmap()
+
+    @classmethod
+    def extract_text(cls, image):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(cls.extract_text_async(image))
+        raise RuntimeError(
+            "Windows OCR cannot be run synchronously while another asyncio loop is active."
+        )
 
 
 class FileManager:
@@ -352,9 +405,9 @@ class CardApp:
         self.collection_view_items = []
 
         self.scale_percent = 200
-        self.blur_size = 7
-        self.block_size = 11
-        self.c_value = 7
+        self.smoothing_percent = 30
+        self.contrast_percent = 125
+        self.sharpness_percent = 125
 
         self.root.geometry("1200x800")
         self.root.resizable(True, True)
@@ -363,10 +416,11 @@ class CardApp:
 
     def get_ocr_settings(self):
         return {
+            "ocr_engine": OCR_ENGINE_NAME,
             "scale_percent": int(self.scale_percent),
-            "blur_size": int(self.blur_size) | 1,
-            "block_size": int(self.block_size) | 1,
-            "c_value": int(self.c_value),
+            "smoothing_percent": int(self.smoothing_percent),
+            "contrast_percent": int(self.contrast_percent),
+            "sharpness_percent": int(self.sharpness_percent),
         }
 
     def setup_ui(self):
@@ -386,7 +440,7 @@ class CardApp:
         file_menu.add_command(label="Load Collection File", command=self.load_collection_file)
         file_menu.add_separator()
         file_menu.add_command(
-            label="Adjust Processing Parameters", command=self.open_slider_window
+            label="Adjust Windows OCR Processing", command=self.open_slider_window
         )
         file_menu.add_command(label="Show OCR Error Log", command=self.show_ocr_errors)
         menu.add_cascade(label="File", menu=file_menu)
@@ -494,67 +548,118 @@ class CardApp:
 
     def open_slider_window(self):
         slider_window = tk.Toplevel(self.root)
-        slider_window.title("Adjust Image Processing Parameters")
+        slider_window.title("Adjust Windows OCR Processing")
+        slider_window.resizable(False, False)
 
-        tk.Label(slider_window, text="Scale Percent:").pack()
-        scale_percent_slider = tk.Scale(slider_window, from_=100, to_=300, orient=tk.HORIZONTAL)
+        controls_frame = tk.Frame(slider_window, padx=10, pady=10)
+        controls_frame.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(controls_frame, text="Image Scale:").pack(anchor=tk.W)
+        scale_percent_slider = tk.Scale(
+            controls_frame,
+            from_=100,
+            to_=300,
+            orient=tk.HORIZONTAL,
+            length=280,
+            label="Percent",
+        )
         scale_percent_slider.set(self.scale_percent)
-        scale_percent_slider.pack()
+        scale_percent_slider.pack(fill=tk.X)
 
-        tk.Label(slider_window, text="Blur Size:").pack()
-        blur_size_slider = tk.Scale(
-            slider_window, from_=1, to_=21, orient=tk.HORIZONTAL, resolution=2
+        tk.Label(controls_frame, text="Smoothing:").pack(anchor=tk.W)
+        smoothing_slider = tk.Scale(
+            controls_frame,
+            from_=0,
+            to_=100,
+            orient=tk.HORIZONTAL,
+            length=280,
+            label="Percent",
         )
-        blur_size_slider.set(self.blur_size)
-        blur_size_slider.pack()
+        smoothing_slider.set(self.smoothing_percent)
+        smoothing_slider.pack(fill=tk.X)
 
-        tk.Label(slider_window, text="Block Size:").pack()
-        block_size_slider = tk.Scale(
-            slider_window, from_=3, to_=21, orient=tk.HORIZONTAL, resolution=2
+        tk.Label(controls_frame, text="Contrast:").pack(anchor=tk.W)
+        contrast_slider = tk.Scale(
+            controls_frame,
+            from_=50,
+            to_=250,
+            orient=tk.HORIZONTAL,
+            length=280,
+            label="Percent",
         )
-        block_size_slider.set(self.block_size)
-        block_size_slider.pack()
+        contrast_slider.set(self.contrast_percent)
+        contrast_slider.pack(fill=tk.X)
 
-        tk.Label(slider_window, text="C Value:").pack()
-        c_value_slider = tk.Scale(slider_window, from_=1, to_=10, orient=tk.HORIZONTAL)
-        c_value_slider.set(self.c_value)
-        c_value_slider.pack()
+        tk.Label(controls_frame, text="Sharpness:").pack(anchor=tk.W)
+        sharpness_slider = tk.Scale(
+            controls_frame,
+            from_=0,
+            to_=300,
+            orient=tk.HORIZONTAL,
+            length=280,
+            label="Percent",
+        )
+        sharpness_slider.set(self.sharpness_percent)
+        sharpness_slider.pack(fill=tk.X)
+
+        result_label = tk.Label(
+            controls_frame, text="", anchor=tk.W, justify=tk.LEFT, wraplength=280
+        )
+        result_label.pack(fill=tk.X, pady=(8, 0))
+
+        def selected_settings():
+            return {
+                "ocr_engine": OCR_ENGINE_NAME,
+                "scale_percent": scale_percent_slider.get(),
+                "smoothing_percent": smoothing_slider.get(),
+                "contrast_percent": contrast_slider.get(),
+                "sharpness_percent": sharpness_slider.get(),
+            }
 
         def apply_changes():
             self.scale_percent = scale_percent_slider.get()
-            self.blur_size = blur_size_slider.get() | 1
-            self.block_size = block_size_slider.get() | 1
-            self.c_value = c_value_slider.get()
+            self.smoothing_percent = smoothing_slider.get()
+            self.contrast_percent = contrast_slider.get()
+            self.sharpness_percent = sharpness_slider.get()
             messagebox.showinfo(
                 "Parameters Applied",
-                "Image processing parameters updated successfully.",
+                "Windows OCR processing parameters updated successfully.",
             )
 
         def update_ocr_text():
-            if self.current_card:
-                try:
-                    settings = {
-                        "scale_percent": scale_percent_slider.get(),
-                        "blur_size": blur_size_slider.get() | 1,
-                        "block_size": block_size_slider.get() | 1,
-                        "c_value": c_value_slider.get(),
-                    }
-                    rotation = self.card_rotation.get(self.current_card, 0)
-                    processed_image = ImageText.preprocess_image(
-                        self.current_card, settings, rotation
-                    )
-                    text = ImageText.extract_text(processed_image).strip()
-                    self.set_card_text(self.current_card, text, settings)
-                    self.textbox.delete("1.0", tk.END)
-                    self.textbox.insert("1.0", text)
-                    self.update_collection_view()
-                except Exception as exc:
-                    messagebox.showerror(
-                        "Error", f"Failed to process and extract text: {exc}"
-                    )
+            if not self.current_card:
+                messagebox.showinfo("No Card Selected", "Select a card before testing OCR.")
+                return
+            try:
+                result_label.config(text="Testing current card...")
+                slider_window.update_idletasks()
+                settings = selected_settings()
+                rotation = self.card_rotation.get(self.current_card, 0)
+                processed_image = ImageText.preprocess_image(
+                    self.current_card, settings, rotation
+                )
+                text = ImageText.extract_text(processed_image).strip()
+                self.set_card_text(self.current_card, text, settings)
+                self.textbox.delete("1.0", tk.END)
+                self.textbox.insert("1.0", text)
+                self.update_collection_view()
+                result_label.config(
+                    text=f"Found {len(text)} characters on the current card."
+                )
+            except Exception as exc:
+                result_label.config(text="OCR test failed.")
+                messagebox.showerror(
+                    "Windows OCR Error", f"Failed to process and extract text: {exc}"
+                )
 
-        tk.Button(slider_window, text="Apply", command=apply_changes).pack()
-        tk.Button(slider_window, text="Test Parameters", command=update_ocr_text).pack()
+        button_frame = tk.Frame(controls_frame)
+        button_frame.pack(fill=tk.X, pady=(10, 0))
+        tk.Button(button_frame, text="Apply", command=apply_changes).pack(
+            side=tk.LEFT, fill=tk.X, expand=True
+        )
+        tk.Button(
+            button_frame, text="Test Current Card", command=update_ocr_text
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     def show_ocr_errors(self):
         log_window = tk.Toplevel(self.root)
@@ -607,7 +712,7 @@ class CardApp:
             return
         if not messagebox.askokcancel(
             "Load Card Text",
-            "OCR can take a while. Cached cards will be skipped. Do you want to proceed?",
+            "Windows OCR can take a while. Cached cards will be skipped. Do you want to proceed?",
         ):
             return
 
@@ -617,7 +722,7 @@ class CardApp:
         self.ocr_cancel_event.clear()
         self.pending_collection_refresh = False
         self.progress_var.set(0)
-        self.status_var.set("Starting OCR...")
+        self.status_var.set("Starting Windows OCR...")
         self.ocr_button.config(state=tk.DISABLED)
         self.cancel_ocr_button.config(state=tk.NORMAL)
         self.ocr_thread = threading.Thread(
